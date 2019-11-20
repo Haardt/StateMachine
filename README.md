@@ -1,6 +1,6 @@
-# StateMachine
+# A fork from 'StateMachine' for reactor (flux/mono) 
 
-[![CircleCI](https://circleci.com/gh/Tinder/StateMachine.svg?style=svg)](https://circleci.com/gh/Tinder/StateMachine)
+- doc's are incompatible!
 
 A Kotlin DSL for finite state machine.
 
