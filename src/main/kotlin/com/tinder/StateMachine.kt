@@ -1,64 +1,61 @@
 package com.tinder
 
-import java.util.concurrent.atomic.AtomicReference
+import reactor.core.publisher.Flux
+import reactor.core.publisher.Mono
+import reactor.kotlin.core.publisher.cast
+import reactor.kotlin.core.publisher.toMono
+import reactor.util.function.Tuple2
+import reactor.kotlin.core.util.function.component1
+import reactor.kotlin.core.util.function.component2
 
-class StateMachine<STATE : Any, EVENT : Any, SIDE_EFFECT : Any> private constructor(
-    private val graph: Graph<STATE, EVENT, SIDE_EFFECT>
-) {
+typealias TransitionAction<CONTEXT, EVENT> = (CONTEXT, EVENT) -> Mono<CONTEXT>
 
-    private val stateRef = AtomicReference<STATE>(graph.initialState)
 
-    val state: STATE
-        get() = stateRef.get()
+class StateMachine<STATE : Any, EVENT : Any, CONTEXT, SIDE_EFFECT : TransitionAction<CONTEXT, EVENT>> private constructor(
+        private val graph: Graph<STATE, EVENT, CONTEXT, SIDE_EFFECT>) {
 
-    fun transition(event: EVENT): Transition<STATE, EVENT, SIDE_EFFECT> {
-        val transition = synchronized(this) {
-            val fromState = stateRef.get()
-            val transition = fromState.getTransition(event)
-            if (transition is Transition.Valid) {
-                stateRef.set(transition.toState)
-            }
-            transition
-        }
-        transition.notifyOnTransition()
-        if (transition is Transition.Valid) {
-            with(transition) {
-                with(fromState) {
-                    notifyOnExit(event)
+    fun transition(startState: STATE, initContext: CONTEXT, event: EVENT): Mono<Pair<STATE, CONTEXT>> {
+        return startState.getTransition(initContext, event).zipWith(Mono.just(initContext))
+                .filter { it.t1 is Transition.Valid }
+                .cast<Tuple2<Transition.Valid<STATE, EVENT, SIDE_EFFECT>, CONTEXT>>()
+                .flatMap { (transition, context) ->
+                    Mono.zip(transition.toMono(), transition.sideEffect?.invoke(context, event)
+                            ?: Mono.just(context))
                 }
-                with(toState) {
-                    notifyOnEnter(event)
-                }
-            }
-        }
-        return transition
+                .flatMap { (transition, context) ->
+                    with(transition) {
+                        with(fromState) {
+                            notifyOnExit(context, event).map { transition.toState to it }
+                        }
+                        with(toState) {
+                            notifyOnEnter(context, event).map { transition.toState to it }
+                        }
+                    }
+                }.switchIfEmpty(Mono.error(IllegalStateException("No transition in state ($startState) for  event ($event) found!")))
     }
 
-    fun with(init: GraphBuilder<STATE, EVENT, SIDE_EFFECT>.() -> Unit): StateMachine<STATE, EVENT, SIDE_EFFECT> {
-        return create(graph.copy(initialState = state), init)
-    }
-
-    private fun STATE.getTransition(event: EVENT): Transition<STATE, EVENT, SIDE_EFFECT> {
+    private fun STATE.getTransition(context: CONTEXT, event: EVENT): Mono<Transition<STATE, EVENT, SIDE_EFFECT>> {
         for ((eventMatcher, createTransitionTo) in getDefinition().transitions) {
             if (eventMatcher.matches(event)) {
-                val (toState, sideEffect) = createTransitionTo(this, event)
-                return Transition.Valid(this, event, toState, sideEffect)
+                return createTransitionTo(this, context, event).map { (toState, sideEffect) ->
+                    Transition.Valid(this, event, toState, sideEffect)
+                }
             }
         }
-        return Transition.Invalid(this, event)
+        return Transition.Invalid<STATE, EVENT, SIDE_EFFECT>(this, event).toMono()
     }
 
     private fun STATE.getDefinition() = graph.stateDefinitions
-        .filter { it.key.matches(this) }
-        .map { it.value }
-        .firstOrNull() ?: error("Missing definition for state ${this.javaClass.simpleName}!")
+            .filter { it.key.matches(this) }
+            .map { it.value }
+            .firstOrNull() ?: error("Missing definition for state ${this.javaClass.simpleName}!")
 
-    private fun STATE.notifyOnEnter(cause: EVENT) {
-        getDefinition().onEnterListeners.forEach { it(this, cause) }
+    private fun STATE.notifyOnEnter(context: CONTEXT, cause: EVENT): Mono<CONTEXT> {
+        return Flux.concat(*getDefinition().onEnterListeners.map { it(context, this, cause) }.toTypedArray()).last(context)
     }
 
-    private fun STATE.notifyOnExit(cause: EVENT) {
-        getDefinition().onExitListeners.forEach { it(this, cause) }
+    private fun STATE.notifyOnExit(context: CONTEXT, cause: EVENT): Mono<CONTEXT> {
+        return Flux.concat(*getDefinition().onExitListeners.map { it(context, this, cause) }.toTypedArray()).last(context)
     }
 
     private fun Transition<STATE, EVENT, SIDE_EFFECT>.notifyOnTransition() {
@@ -71,32 +68,31 @@ class StateMachine<STATE : Any, EVENT : Any, SIDE_EFFECT : Any> private construc
         abstract val event: EVENT
 
         data class Valid<out STATE : Any, out EVENT : Any, out SIDE_EFFECT : Any> internal constructor(
-            override val fromState: STATE,
-            override val event: EVENT,
-            val toState: STATE,
-            val sideEffect: SIDE_EFFECT?
+                override val fromState: STATE,
+                override val event: EVENT,
+                val toState: STATE,
+                val sideEffect: SIDE_EFFECT?
         ) : Transition<STATE, EVENT, SIDE_EFFECT>()
 
         data class Invalid<out STATE : Any, out EVENT : Any, out SIDE_EFFECT : Any> internal constructor(
-            override val fromState: STATE,
-            override val event: EVENT
+                override val fromState: STATE,
+                override val event: EVENT
         ) : Transition<STATE, EVENT, SIDE_EFFECT>()
     }
 
-    data class Graph<STATE : Any, EVENT : Any, SIDE_EFFECT : Any>(
-        val initialState: STATE,
-        val stateDefinitions: Map<Matcher<STATE, STATE>, State<STATE, EVENT, SIDE_EFFECT>>,
-        val onTransitionListeners: List<(Transition<STATE, EVENT, SIDE_EFFECT>) -> Unit>
+    data class Graph<STATE : Any, EVENT : Any, CONTEXT, SIDE_EFFECT : Any>(
+            val stateDefinitions: Map<Matcher<STATE, STATE>, State<STATE, EVENT, CONTEXT, SIDE_EFFECT>>,
+            val onTransitionListeners: List<(Transition<STATE, EVENT, SIDE_EFFECT>) -> Unit>
     ) {
 
-        class State<STATE : Any, EVENT : Any, SIDE_EFFECT : Any> internal constructor() {
-            val onEnterListeners = mutableListOf<(STATE, EVENT) -> Unit>()
-            val onExitListeners = mutableListOf<(STATE, EVENT) -> Unit>()
-            val transitions = linkedMapOf<Matcher<EVENT, EVENT>, (STATE, EVENT) -> TransitionTo<STATE, SIDE_EFFECT>>()
+        class State<STATE : Any, EVENT : Any, CONTEXT, SIDE_EFFECT : Any> internal constructor() {
+            val onEnterListeners = mutableListOf<(CONTEXT, STATE, EVENT) -> Mono<CONTEXT>>()
+            val onExitListeners = mutableListOf<(CONTEXT, STATE, EVENT) -> Mono<CONTEXT>>()
+            val transitions = linkedMapOf<Matcher<EVENT, EVENT>, (STATE, CONTEXT, EVENT) -> Mono<TransitionTo<STATE, SIDE_EFFECT>>>()
 
             data class TransitionTo<out STATE : Any, out SIDE_EFFECT : Any> internal constructor(
-                val toState: STATE,
-                val sideEffect: SIDE_EFFECT?
+                    val toState: STATE,
+                    val sideEffect: SIDE_EFFECT?
             )
         }
     }
@@ -123,20 +119,15 @@ class StateMachine<STATE : Any, EVENT : Any, SIDE_EFFECT : Any> private construc
         }
     }
 
-    class GraphBuilder<STATE : Any, EVENT : Any, SIDE_EFFECT : Any>(
-        graph: Graph<STATE, EVENT, SIDE_EFFECT>? = null
+    class GraphBuilder<STATE : Any, EVENT : Any, CONTEXT, SIDE_EFFECT : Any>(
+            graph: Graph<STATE, EVENT, CONTEXT, SIDE_EFFECT>? = null
     ) {
-        private var initialState = graph?.initialState
         private val stateDefinitions = LinkedHashMap(graph?.stateDefinitions ?: emptyMap())
         private val onTransitionListeners = ArrayList(graph?.onTransitionListeners ?: emptyList())
 
-        fun initialState(initialState: STATE) {
-            this.initialState = initialState
-        }
-
         fun <S : STATE> state(
-            stateMatcher: Matcher<STATE, S>,
-            init: StateDefinitionBuilder<S>.() -> Unit
+                stateMatcher: Matcher<STATE, S>,
+                init: StateDefinitionBuilder<S>.() -> Unit
         ) {
             stateDefinitions[stateMatcher] = StateDefinitionBuilder<S>().apply(init).build()
         }
@@ -153,52 +144,52 @@ class StateMachine<STATE : Any, EVENT : Any, SIDE_EFFECT : Any> private construc
             onTransitionListeners.add(listener)
         }
 
-        fun build(): Graph<STATE, EVENT, SIDE_EFFECT> {
-            return Graph(requireNotNull(initialState), stateDefinitions.toMap(), onTransitionListeners.toList())
+        fun build(): Graph<STATE, EVENT, CONTEXT, SIDE_EFFECT> {
+            return Graph(stateDefinitions.toMap(), onTransitionListeners.toList())
         }
 
         inner class StateDefinitionBuilder<S : STATE> {
 
-            private val stateDefinition = Graph.State<STATE, EVENT, SIDE_EFFECT>()
+            private val stateDefinition = Graph.State<STATE, EVENT, CONTEXT, SIDE_EFFECT>()
 
             inline fun <reified E : EVENT> any(): Matcher<EVENT, E> = Matcher.any()
 
             inline fun <reified R : EVENT> eq(value: R): Matcher<EVENT, R> = Matcher.eq(value)
 
             fun <E : EVENT> on(
-                eventMatcher: Matcher<EVENT, E>,
-                createTransitionTo: S.(E) -> Graph.State.TransitionTo<STATE, SIDE_EFFECT>
+                    eventMatcher: Matcher<EVENT, E>,
+                    createTransitionTo: S.(CONTEXT, E) -> Mono<Graph.State.TransitionTo<STATE, SIDE_EFFECT>>
             ) {
-                stateDefinition.transitions[eventMatcher] = { state, event ->
+                stateDefinition.transitions[eventMatcher] = { state, context, event ->
                     @Suppress("UNCHECKED_CAST")
-                    createTransitionTo((state as S), event as E)
+                    createTransitionTo((state as S), context, event as E)
                 }
             }
 
             inline fun <reified E : EVENT> on(
-                noinline createTransitionTo: S.(E) -> Graph.State.TransitionTo<STATE, SIDE_EFFECT>
+                    noinline createTransitionTo: S.(CONTEXT, E) -> Mono<Graph.State.TransitionTo<STATE, SIDE_EFFECT>>
             ) {
                 return on(any(), createTransitionTo)
             }
 
             inline fun <reified E : EVENT> on(
-                event: E,
-                noinline createTransitionTo: S.(E) -> Graph.State.TransitionTo<STATE, SIDE_EFFECT>
+                    event: E,
+                    noinline createTransitionTo: S.(CONTEXT, E) -> Mono<Graph.State.TransitionTo<STATE, SIDE_EFFECT>>
             ) {
                 return on(eq(event), createTransitionTo)
             }
 
-            fun onEnter(listener: S.(EVENT) -> Unit) = with(stateDefinition) {
-                onEnterListeners.add { state, cause ->
+            fun onEnter(listener: S.(CONTEXT, EVENT) -> Mono<CONTEXT>) = with(stateDefinition) {
+                onEnterListeners.add { context, state, cause ->
                     @Suppress("UNCHECKED_CAST")
-                    listener(state as S, cause)
+                    listener(state as S, context, cause)
                 }
             }
 
-            fun onExit(listener: S.(EVENT) -> Unit) = with(stateDefinition) {
-                onExitListeners.add { state, cause ->
+            fun onExit(listener: S.(CONTEXT, EVENT) -> Mono<CONTEXT>) = with(stateDefinition) {
+                onExitListeners.add { context, state, cause ->
                     @Suppress("UNCHECKED_CAST")
-                    listener(state as S, cause)
+                    listener(state as S, context, cause)
                 }
             }
 
@@ -206,7 +197,7 @@ class StateMachine<STATE : Any, EVENT : Any, SIDE_EFFECT : Any> private construc
 
             @Suppress("UNUSED") // The unused warning is probably a compiler bug.
             fun S.transitionTo(state: STATE, sideEffect: SIDE_EFFECT? = null) =
-                Graph.State.TransitionTo(state, sideEffect)
+                    Graph.State.TransitionTo(state, sideEffect)
 
             @Suppress("UNUSED") // The unused warning is probably a compiler bug.
             fun S.dontTransition(sideEffect: SIDE_EFFECT? = null) = transitionTo(this, sideEffect)
@@ -214,16 +205,16 @@ class StateMachine<STATE : Any, EVENT : Any, SIDE_EFFECT : Any> private construc
     }
 
     companion object {
-        fun <STATE : Any, EVENT : Any, SIDE_EFFECT : Any> create(
-            init: GraphBuilder<STATE, EVENT, SIDE_EFFECT>.() -> Unit
-        ): StateMachine<STATE, EVENT, SIDE_EFFECT> {
+        fun <STATE : Any, EVENT : Any, CONTEXT, SIDE_EFFECT : TransitionAction<CONTEXT, EVENT>> create(
+                init: GraphBuilder<STATE, EVENT, CONTEXT, SIDE_EFFECT>.() -> Unit
+        ): StateMachine<STATE, EVENT, CONTEXT, SIDE_EFFECT> {
             return create(null, init)
         }
 
-        private fun <STATE : Any, EVENT : Any, SIDE_EFFECT : Any> create(
-            graph: Graph<STATE, EVENT, SIDE_EFFECT>?,
-            init: GraphBuilder<STATE, EVENT, SIDE_EFFECT>.() -> Unit
-        ): StateMachine<STATE, EVENT, SIDE_EFFECT> {
+        private fun <STATE : Any, EVENT : Any, CONTEXT, SIDE_EFFECT : TransitionAction<CONTEXT, EVENT>> create(
+                graph: Graph<STATE, EVENT, CONTEXT, SIDE_EFFECT>?,
+                init: GraphBuilder<STATE, EVENT, CONTEXT, SIDE_EFFECT>.() -> Unit
+        ): StateMachine<STATE, EVENT, CONTEXT, SIDE_EFFECT> {
             return StateMachine(GraphBuilder(graph).apply(init).build())
         }
     }
